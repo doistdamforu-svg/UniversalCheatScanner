@@ -558,6 +558,8 @@ function Analyze-JarForensics {
         if ($mApi.Verified) {
             $result.ModrinthVerified = $true
             $result.ModrinthTitle    = $mApi.Name
+            $result.IsSuspicious     = $false
+            return $result
         }
     }
 
@@ -697,6 +699,15 @@ function Analyze-JarForensics {
     # Flag Condition
     if ($result.ClientMatches.Count -gt 0 -or $result.ModuleMatches.Count -gt 0 -or $result.FullwidthMatches.Count -gt 0 -or $result.TrojanAlerts.Count -gt 0) {
         $result.IsSuspicious = $true
+    }
+
+    # Suppress all flags for already verified mods from Modrinth
+    if ($result.ModrinthVerified) {
+        $result.IsSuspicious = $false
+        $result.ClientMatches.Clear()
+        $result.ModuleMatches.Clear()
+        $result.FullwidthMatches.Clear()
+        $result.TrojanAlerts.Clear()
     }
 
     return $result
