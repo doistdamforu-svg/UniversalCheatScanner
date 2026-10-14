@@ -57,7 +57,7 @@ using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Text;
 
-public class LiveMemoryScanner {
+public class FastLiveMemoryScanner {
     [DllImport("kernel32.dll", SetLastError = true)]
     public static extern IntPtr OpenProcess(int dwDesiredAccess, bool bInheritHandle, int dwProcessId);
 
@@ -877,7 +877,7 @@ if ($runningMc) {
     )
 
     try {
-        $ramHits = [LiveMemoryScanner]::ScanProcessMemory($runningMc.Pid, $ramSignatures, 80)
+        $ramHits = [FastLiveMemoryScanner]::ScanProcessMemory($runningMc.Pid, $ramSignatures, 80)
     } catch { }
 
     if ($ramHits.Count -gt 0) {
