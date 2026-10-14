@@ -87,41 +87,48 @@ public class LiveMemoryScanner {
     const uint PAGE_GUARD = 0x100;
     const uint PAGE_NOACCESS = 0x01;
 
-    public static List<string> ScanProcessMemory(int pid, string[] signatures, int maxMbToScan = 250) {
+    const int CHUNK_SIZE = 1024 * 1024; // 1MB buffer
+
+    public static List<string> ScanProcessMemory(int pid, string[] signatures, int maxMbToScan = 80) {
         var foundMatches = new List<string>();
         IntPtr hProc = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, false, pid);
         if (hProc == IntPtr.Zero) return foundMatches;
 
-        long address = 0;
+        long address = 0x10000;
         long totalScannedBytes = 0;
         long maxBytes = (long)maxMbToScan * 1024 * 1024;
         int structSize = Marshal.SizeOf(typeof(MEMORY_BASIC_INFORMATION));
         MEMORY_BASIC_INFORMATION memInfo;
 
-        while (address < 0x7FFFFFFF0000 && totalScannedBytes < maxBytes) {
+        byte[] buffer = new byte[CHUNK_SIZE];
+
+        while (address < 0x00007FFFFFFE0000 && totalScannedBytes < maxBytes) {
             int ret = VirtualQueryEx(hProc, (IntPtr)address, out memInfo, (uint)structSize);
             if (ret == 0) break;
 
-            long size = (long)memInfo.RegionSize;
-            if (size > 0 && size <= 40 * 1024 * 1024 && memInfo.State == MEM_COMMIT && (memInfo.Protect & PAGE_GUARD) == 0 && (memInfo.Protect & PAGE_NOACCESS) == 0) {
-                byte[] buffer = new byte[size];
-                IntPtr bytesRead;
-                if (ReadProcessMemory(hProc, memInfo.BaseAddress, buffer, (int)size, out bytesRead)) {
-                    int readLen = (int)bytesRead;
-                    totalScannedBytes += readLen;
-                    string ascii = Encoding.ASCII.GetString(buffer, 0, readLen);
-
-                    for (int i = 0; i < signatures.Length; i++) {
-                        string s = signatures[i];
-                        if (ascii.IndexOf(s, StringComparison.OrdinalIgnoreCase) >= 0) {
-                            if (!foundMatches.Contains(s)) {
-                                foundMatches.Add(s);
+            long regionSize = (long)memInfo.RegionSize;
+            if (regionSize > 0 && memInfo.State == MEM_COMMIT && (memInfo.Protect & PAGE_GUARD) == 0 && (memInfo.Protect & PAGE_NOACCESS) == 0) {
+                long regionOffset = 0;
+                while (regionOffset < regionSize && totalScannedBytes < maxBytes) {
+                    int toRead = (int)Math.Min((long)CHUNK_SIZE, regionSize - regionOffset);
+                    IntPtr bytesRead;
+                    if (ReadProcessMemory(hProc, (IntPtr)((long)memInfo.BaseAddress + regionOffset), buffer, toRead, out bytesRead)) {
+                        int readLen = (int)bytesRead;
+                        if (readLen > 0) {
+                            totalScannedBytes += readLen;
+                            string text = Encoding.ASCII.GetString(buffer, 0, readLen);
+                            for (int i = 0; i < signatures.Length; i++) {
+                                string s = signatures[i];
+                                if (!foundMatches.Contains(s) && text.IndexOf(s, StringComparison.OrdinalIgnoreCase) >= 0) {
+                                    foundMatches.Add(s);
+                                }
                             }
                         }
                     }
+                    regionOffset += toRead;
                 }
             }
-            address = (long)memInfo.BaseAddress + size;
+            address = (long)memInfo.BaseAddress + regionSize;
         }
 
         CloseHandle(hProc);
@@ -772,7 +779,7 @@ $targetList = [System.Collections.Generic.List[PSCustomObject]]::new()
 $runningClasspath = @()
 
 if ($runningMc) {
-    Write-Host " [✓] DETECTED ACTIVE MINECRAFT PROCESS!" -ForegroundColor Green
+    Write-Host " [OK] DETECTED ACTIVE MINECRAFT PROCESS!" -ForegroundColor Green
     Write-Host "     Process PID  : $($runningMc.Pid) ($($runningMc.ProcessName))" -ForegroundColor White
     Write-Host "     Minecraft Ver: $($runningMc.Version)" -ForegroundColor Yellow
     Write-Host "     Active Player: $($runningMc.Username)" -ForegroundColor Cyan
@@ -816,8 +823,8 @@ if ($runningMc) {
         Write-Host "$($inst.Name) " -NoNewline -ForegroundColor Yellow
         Write-Host "($($inst.ModCount) mods/jars)" -ForegroundColor DarkGray
     }
-    Write-Host " [A]   Scan ALL detected instances & profiles" -ForegroundColor Cyan
-    Write-Host " [C]   Enter custom path manually (or drag & drop folder/jar)" -ForegroundColor Magenta
+    Write-Host " [A]   Scan ALL detected instances and profiles" -ForegroundColor Cyan
+    Write-Host " [C]   Enter custom path manually (or drag and drop folder/jar)" -ForegroundColor Magenta
     Write-Host " ========================================================================" -ForegroundColor DarkGray
     Write-Host ""
     $sel = Read-Host " Enter choice (Default: 1)"
@@ -870,16 +877,16 @@ if ($runningMc) {
     )
 
     try {
-        $ramHits = [LiveMemoryScanner]::ScanProcessMemory($runningMc.Pid, $ramSignatures, 300)
+        $ramHits = [LiveMemoryScanner]::ScanProcessMemory($runningMc.Pid, $ramSignatures, 80)
     } catch { }
 
     if ($ramHits.Count -gt 0) {
         Write-Host " [!] ALERT: CHEAT STRINGS DETECTED IN ACTIVE RAM MEMORY:" -ForegroundColor Red
         foreach ($rh in $ramHits) {
-            Write-Host "     >>> RAM String Hit: $rh" -ForegroundColor Red
+            Write-Host "     -> RAM String Hit: $rh" -ForegroundColor Red
         }
     } else {
-        Write-Host " [✓] Process RAM memory scan complete: Clean of known cheat signatures." -ForegroundColor Green
+        Write-Host " [OK] Process RAM memory scan complete: Clean of known cheat signatures." -ForegroundColor Green
     }
     Write-Host ""
 }
@@ -890,7 +897,7 @@ $jvmInjections = Check-JvmInjections
 if ($jvmInjections.Count -gt 0) {
     Write-Host " [ALERT] SUSPICIOUS RUNTIME INJECTIONS / AGENTS FOUND:" -ForegroundColor Red
     foreach ($ai in $jvmInjections) {
-        Write-Host "   >>> $ai" -ForegroundColor Red
+        Write-Host "   -> $ai" -ForegroundColor Red
     }
 } else {
     Write-Host " [OK] All JVM agents verified clean (Modrinth Theseus whitelisted)." -ForegroundColor Green
@@ -902,7 +909,7 @@ $dnsAlerts = Check-DnsCacheForensics
 if ($dnsAlerts.Count -gt 0) {
     Write-Host " [ALERT] FORENSIC DNS CACHE HITS (Cheat Server Connections Detected):" -ForegroundColor Red
     foreach ($da in $dnsAlerts) {
-        Write-Host "   >>> DNS Domain Resolved: $da" -ForegroundColor Red
+        Write-Host "   -> DNS Domain Resolved: $da" -ForegroundColor Red
     }
     Write-Host ""
 }
@@ -919,7 +926,7 @@ foreach ($t in $targetList) {
 
     $rawJars = Collect-TargetJars -Instance $t -ExplicitClasspathJars $runningClasspath -ScanLoader $IncludeLoader
     $jarFiles = @($rawJars)
-    Write-Host " Found $($jarFiles.Count) JAR(s) to analyze (including Mods, Fabric Loader & Classpath)." -ForegroundColor Green
+    Write-Host " Found $($jarFiles.Count) JAR(s) to analyze (including Mods, Fabric Loader and Classpath)." -ForegroundColor Green
     Write-Host ""
 
     $curIdx = 0
