@@ -68,7 +68,30 @@ The scanner performs multi-layer inspection on `.class`, `.json`, and `MANIFEST.
   * Identifies known cheat obfuscators (*Skidfuscator, Paramorphism, Radon, Bozar, Branchlock, Binscure, Zelix KlassMaster, JNIC, Scuti, Smoke*).
   * Unpacks and inspects **Nested JARs (Jar-in-Jar)** recursively.
 * **Active JVM Runtime Injection Scanner**:
-  * Detects suspicious external `-javaagent:`, `-Xbootclasspath`, native agents, and remote JDWP debug hooks on any running `java.exe` / `javaw.exe`.
+  * Detects suspicious external `-javaagent:`, `-Xbootclasspath`, native agents, and remote JDWP debug hooks on any running `java.exe` / `javaw.exe` (with automatic whitelisting of official launcher agents like Modrinth Theseus).
+
+---
+
+### 3. Live RAM Memory & Anti-Self-Destruct Forensics
+The scanner includes forensic detection specifically engineered to catch cheats that **self-destruct**, timestomp, and redownload clean mods:
+
+* **Live Process RAM Memory Scanner (C# Win32 Engine)**:
+  * Uses `OpenProcess`, `VirtualQueryEx`, and `ReadProcessMemory` to scan committed JVM heap memory in real time.
+  * Catches active cheats and **terminated / self-destructed cheat strings** that linger in Java memory even after files on disk have been removed.
+* **Memory-to-Disk Divergence (The #1 ScreenShare Smoking Gun)**:
+  * Correlates live RAM traces with disk contents. If memory contains cheat signatures (`AimAssist`, `HoverTotem`, `ShieldDisabler`, `MaceSwap`, etc.) while mods on disk are clean/verified from Modrinth, the scanner flags an immediate **`[CRITICAL] Memory/Disk Divergence`** alert.
+* **Runtime Mod Hot-Swapping Detection**:
+  * Compares Minecraft's process start time (`proc.StartTime`) against the `CreationTime` and `LastWriteTime` of every mod in the active instance.
+  * Detects when a mod was downloaded or replaced on disk *while Minecraft was actively running*.
+* **NTFS Timestomping & Timestamp Paradoxes**:
+  * Catches files where `LastWriteTime < CreationTime` (physically impossible under normal OS operations).
+  * Detects zero sub-second timestamps (`.000ms`), characteristic of standard PowerShell/Win32 `SetFileTime` timestomping scripts.
+* **Fresh Mod Redownload Footprint**:
+  * Detects when verified Modrinth mods were downloaded very recently (during the active session or within the last 4 hours) to replace cheat jars.
+* **PowerShell Console History Audit**:
+  * Inspects `ConsoleHost_history.txt` for self-destruct commands (`SetFileTime`, `LastWriteTime`, `cdn.modrinth.com`, `clean.bat`, `del /f /q`).
+* **Prefetch Execution Tracing**:
+  * Inspects `C:\Windows\Prefetch` for recent executions of external downloaders or anti-forensic tools (`CURL.EXE`, `BITSADMIN.EXE`, `CERTUTIL.EXE`, `FSUTIL.EXE`).
 
 ---
 

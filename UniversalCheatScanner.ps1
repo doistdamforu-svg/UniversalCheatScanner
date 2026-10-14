@@ -40,6 +40,7 @@ Write-Host "   UNIVERSAL MINECRAFT CHEAT SCANNER (lwkyyy Forensic Engine)       
 Write-Host "  ========================================================================" -ForegroundColor Cyan
 Write-Host "   [+] Live RAM Memory Inspection (Active & Terminated Cheat Strings)     " -ForegroundColor DarkCyan
 Write-Host "   [+] Auto-Detect Active Instance & Classpath (Fabric Loader, Forge)     " -ForegroundColor DarkCyan
+Write-Host "   [+] Anti-Self-Destruct Forensics (Timestomping, Memory-Disk Checks)    " -ForegroundColor DarkCyan
 Write-Host "   [+] Deep Heuristic Search: 380+ Clients, Fullwidth Unicode, Trojans    " -ForegroundColor DarkCyan
 Write-Host "  ------------------------------------------------------------------------" -ForegroundColor DarkGray
 Write-Host ""
@@ -783,7 +784,144 @@ function Check-DnsCacheForensics {
 }
 
 # ------------------------------------------------------------------------------
-# 10. MAIN CONTROLLER & EXECUTION WORKFLOW
+# 10. ANTI-SELF-DESTRUCT & TIMESTOMPING FORENSIC ENGINE
+# ------------------------------------------------------------------------------
+function Detect-SelfDestructForensics {
+    param(
+        [PSCustomObject]$Instance,
+        [PSCustomObject]$RunningProcess,
+        [string[]]$RamHits,
+        [System.Collections.Generic.List[PSCustomObject]]$JarResults
+    )
+
+    $sdAlerts = [System.Collections.Generic.List[PSCustomObject]]::new()
+
+    # Resolve target mods folder
+    $targetModsDir = ""
+    if ($Instance -and $Instance.ModsDir -and (Test-Path $Instance.ModsDir)) {
+        if ((Get-Item $Instance.ModsDir) -is [System.IO.DirectoryInfo]) {
+            $targetModsDir = $Instance.ModsDir
+        }
+    }
+    if (-not $targetModsDir -and $RunningProcess -and $RunningProcess.GameDir) {
+        $candidate = Join-Path $RunningProcess.GameDir "mods"
+        if (Test-Path $candidate) { $targetModsDir = $candidate }
+    }
+
+    # 1. Memory-to-Disk Discrepancy (Primary ScreenShare Smoking Gun)
+    # If live RAM contains active cheat signatures, but mods on disk are verified/clean:
+    if ($RunningProcess -and $RamHits -and $RamHits.Count -gt 0) {
+        $flaggedModsOnDisk = @($JarResults | Where-Object { $_.IsSuspicious -and $_.Category -eq "MOD" })
+        if ($flaggedModsOnDisk.Count -eq 0) {
+            [void]$sdAlerts.Add([PSCustomObject]@{
+                Severity    = "CRITICAL"
+                Type        = "Memory/Disk Divergence"
+                Description = "Live RAM contains cheat signatures ($($RamHits -join ', ')), but disk mods are clean/verified from Modrinth! The cheat was deleted or replaced with an original Modrinth mod after launching!"
+            })
+        }
+    }
+
+    # 2. Runtime Mod Hot-Swapping (File modified/created AFTER Minecraft started)
+    if ($RunningProcess -and $RunningProcess.StartTime -and $targetModsDir) {
+        $procStartUtc = $RunningProcess.StartTime.ToUniversalTime()
+        $jars = Get-ChildItem -Path $targetModsDir -Filter "*.jar" -File -ErrorAction SilentlyContinue
+        foreach ($j in $jars) {
+            if ($j.LastWriteTimeUtc -gt $procStartUtc -or $j.CreationTimeUtc -gt $procStartUtc) {
+                [void]$sdAlerts.Add([PSCustomObject]@{
+                    Severity    = "CRITICAL"
+                    Type        = "Runtime File Replacement"
+                    Description = "Mod '$($j.Name)' was created/modified at $($j.LastWriteTimeUtc.ToString('u')), which is AFTER Minecraft started at $($procStartUtc.ToString('u'))! (File was swapped or downloaded while playing)"
+                })
+            }
+        }
+    }
+
+    # 3. Timestomping & Timestamp Paradox Detection
+    if ($targetModsDir) {
+        $jars = Get-ChildItem -Path $targetModsDir -Filter "*.jar" -File -ErrorAction SilentlyContinue
+        foreach ($j in $jars) {
+            # Paradox A: LastWriteTime is BEFORE CreationTime (Modified before created)
+            if ($j.LastWriteTimeUtc -lt $j.CreationTimeUtc.AddSeconds(-2)) {
+                [void]$sdAlerts.Add([PSCustomObject]@{
+                    Severity    = "HIGH"
+                    Type        = "Timestomp Paradox"
+                    Description = "Mod '$($j.Name)' has LastWriteTime ($($j.LastWriteTimeUtc.ToString('u'))) BEFORE CreationTime ($($j.CreationTimeUtc.ToString('u')))! Sign of manual file timestomping."
+                })
+            }
+            # Paradox B: Zero Sub-seconds (Millisecond precision stripped by naive SetFileTime scripts)
+            if ($j.CreationTimeUtc.Millisecond -eq 0 -and $j.LastWriteTimeUtc.Millisecond -eq 0 -and $j.LastWriteTimeUtc -gt (Get-Date).AddDays(-30).ToUniversalTime()) {
+                [void]$sdAlerts.Add([PSCustomObject]@{
+                    Severity    = "SUSPICIOUS"
+                    Type        = "Zero Sub-second Timestomp"
+                    Description = "Mod '$($j.Name)' has exact 000ms timestamps on both Creation & Write times (characteristic of PowerShell/Win32 SetFileTime scripts)."
+                })
+            }
+        }
+    }
+
+    # 4. Modrinth Fresh Redownload Detection (Files downloaded in the last 4 hours)
+    if ($targetModsDir) {
+        $recentThreshold = (Get-Date).AddHours(-4).ToUniversalTime()
+        $recentJars = Get-ChildItem -Path $targetModsDir -Filter "*.jar" -File -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTimeUtc -gt $recentThreshold -or $_.CreationTimeUtc -gt $recentThreshold }
+        foreach ($rj in $recentJars) {
+            $matchVer = $JarResults | Where-Object { $_.Name -eq $rj.Name -and $_.ModrinthVerified }
+            if ($matchVer) {
+                [void]$sdAlerts.Add([PSCustomObject]@{
+                    Severity    = "WARNING"
+                    Type        = "Fresh Mod Redownload"
+                    Description = "Mod '$($rj.Name)' was downloaded/replaced very recently ($($rj.LastWriteTimeUtc.ToString('u'))). Matches Modrinth official file (classic self-destruct replacement signature)."
+                })
+            }
+        }
+    }
+
+    # 5. PowerShell History Self-Destruct Logs
+    try {
+        $histPath = (Get-PSReadLineOption).HistorySavePath
+        if (Test-Path $histPath) {
+            $lines = Get-Content $histPath -ErrorAction SilentlyContinue | Select-Object -Last 200
+            $sdCmds = @($lines | Where-Object { $_ -match "(?i)(SetFileTime|\.LastWriteTime\s*=|\.CreationTime\s*=|(curl|iwr|Invoke-WebRequest).*(cdn\.modrinth|api\.modrinth)|selfdestruct|clean\.bat)" })
+            foreach ($cmd in $sdCmds) {
+                [void]$sdAlerts.Add([PSCustomObject]@{
+                    Severity    = "CRITICAL"
+                    Type        = "PowerShell Self-Destruct Command"
+                    Description = "Found self-destruct command in PowerShell history: $cmd"
+                })
+            }
+        }
+    } catch { }
+
+    # 6. Prefetch Execution of Downloader & Anti-Forensic Utilities
+    try {
+        $pfFiles = Get-ChildItem -Path "C:\Windows\Prefetch" -Filter "*.pf" -ErrorAction SilentlyContinue
+        $recentPf = @($pfFiles | Where-Object { $_.LastWriteTime -gt (Get-Date).AddHours(-4) -and ($_.Name -match "(?i)(CURL|BITSADMIN|CERTUTIL|FSUTIL)") })
+        foreach ($pf in $recentPf) {
+            $sev = if ($pf.Name -match "FSUTIL") { "CRITICAL" } else { "SUSPICIOUS" }
+            [void]$sdAlerts.Add([PSCustomObject]@{
+                Severity    = $sev
+                Type        = "Prefetch Downloader / Cleaner"
+                Description = "Recent execution of '$($pf.Name)' at $($pf.LastWriteTime.ToString('u')) (used for downloading replacement jars or wiping USN journals)."
+            })
+        }
+    } catch { }
+
+    # 7. Recycle Bin Residuals (Recently deleted JARs)
+    try {
+        $rbJars = @(Get-ChildItem -Path "C:\`$Recycle.Bin" -Filter "*.jar" -Recurse -Force -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -gt (Get-Date).AddHours(-4) } | Select-Object -First 5)
+        foreach ($rj in $rbJars) {
+            [void]$sdAlerts.Add([PSCustomObject]@{
+                Severity    = "HIGH"
+                Type        = "Deleted JAR in Recycle Bin"
+                Description = "Recently deleted JAR found in Recycle Bin: '$($rj.Name)' deleted/modified at $($rj.LastWriteTime.ToString('u'))"
+            })
+        }
+    } catch { }
+
+    return ,$sdAlerts
+}
+
+# ------------------------------------------------------------------------------
+# 11. MAIN CONTROLLER & EXECUTION WORKFLOW
 # ------------------------------------------------------------------------------
 
 # Step A: Check Target or Active Running Instance!
@@ -997,7 +1135,27 @@ foreach ($t in $targetList) {
 }
 
 # ------------------------------------------------------------------------------
-# 11. FINAL FORENSIC SUMMARY REPORT
+# 11. ANTI-SELF-DESTRUCT & TIMESTOMPING FORENSIC AUDIT
+# ------------------------------------------------------------------------------
+Write-Host " [*] Running Anti-Self-Destruct & Timestomping Forensics..." -ForegroundColor DarkCyan
+$selfDestructAlerts = [System.Collections.Generic.List[PSCustomObject]]::new()
+$primaryTarget = if ($targetList.Count -gt 0) { $targetList[0] } else { $null }
+$selfDestructAlerts = Detect-SelfDestructForensics -Instance $primaryTarget -RunningProcess $runningMc -RamHits $ramHits -JarResults $allResults
+
+if ($selfDestructAlerts.Count -gt 0) {
+    Write-Host " [!] ALERT: SELF-DESTRUCT OR TIMESTOMPING ANOMALIES DETECTED:" -ForegroundColor Red
+    foreach ($sda in $selfDestructAlerts) {
+        $color = if ($sda.Severity -eq "CRITICAL") { "Red" } elseif ($sda.Severity -eq "HIGH") { "Yellow" } else { "Magenta" }
+        Write-Host "     [$($sda.Severity)] $($sda.Type)" -ForegroundColor $color
+        Write-Host "     -> $($sda.Description)" -ForegroundColor White
+    }
+} else {
+    Write-Host " [OK] No self-destruct routines, timestomping, or runtime file swaps detected." -ForegroundColor Green
+}
+Write-Host ""
+
+# ------------------------------------------------------------------------------
+# 12. FINAL FORENSIC SUMMARY REPORT
 # ------------------------------------------------------------------------------
 $flaggedItems = @($allResults | Where-Object { $_.IsSuspicious })
 $verifiedItems = @($allResults | Where-Object { $_.ModrinthVerified })
@@ -1011,15 +1169,22 @@ Write-Host " Officially Verified Mods  : $($verifiedItems.Count)" -ForegroundCol
 Write-Host " Clean / Unflagged JARs    : $cleanItemsCount" -ForegroundColor Gray
 Write-Host " Flagged Suspicious Files  : $($flaggedItems.Count)" -ForegroundColor $(if ($flaggedItems.Count -gt 0) { "Red" } else { "Green" })
 Write-Host " RAM Memory Cheat Traces   : $($ramHits.Count)" -ForegroundColor $(if ($ramHits.Count -gt 0) { "Red" } else { "Green" })
+Write-Host " Self-Destruct / Timestomp : $(@($selfDestructAlerts).Count)" -ForegroundColor $(if (@($selfDestructAlerts).Count -gt 0) { "Red" } else { "Green" })
 Write-Host " Active JVM Injections     : $($jvmInjections.Count)" -ForegroundColor $(if ($jvmInjections.Count -gt 0) { "Red" } else { "Green" })
 Write-Host " DNS Cache Cheat Domains   : $($dnsAlerts.Count)" -ForegroundColor $(if ($dnsAlerts.Count -gt 0) { "Red" } else { "Green" })
 Write-Host "------------------------------------------------------------------------" -ForegroundColor DarkCyan
 
-if ($flaggedItems.Count -gt 0 -or $ramHits.Count -gt 0 -or $dnsAlerts.Count -gt 0) {
+if ($flaggedItems.Count -gt 0 -or $ramHits.Count -gt 0 -or $dnsAlerts.Count -gt 0 -or $selfDestructAlerts.Count -gt 0) {
     Write-Host ""
     Write-Host " [!] SUMMARY OF FLAGGED DETECTIONS:" -ForegroundColor Red
     if ($ramHits.Count -gt 0) {
         Write-Host " -> LIVE RAM MEMORY DETECTIONS: $($ramHits -join ', ')" -ForegroundColor Red
+    }
+    if ($selfDestructAlerts.Count -gt 0) {
+        Write-Host " -> SELF-DESTRUCT & TIMESTOMPING FLAGS ($($selfDestructAlerts.Count) alert(s)):" -ForegroundColor Red
+        foreach ($sda in $selfDestructAlerts) {
+            Write-Host "    [$($sda.Severity)] $($sda.Type): $($sda.Description)" -ForegroundColor Yellow
+        }
     }
     if ($dnsAlerts.Count -gt 0) {
         Write-Host " -> DNS CACHE CHEAT DOMAINS   : $($dnsAlerts -join ', ')" -ForegroundColor Red
