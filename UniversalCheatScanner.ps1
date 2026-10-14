@@ -1,9 +1,13 @@
 <#
 ================================================================================
  UNIVERSAL MINECRAFT CHEAT & FORENSIC INSTANCE SCANNER (lwkyyy engine)
- Works across ALL Minecraft versions (1.7.10, 1.8.9, 1.12.2, 1.16.5, 1.20, 1.21+)
- Supports Fabric, Forge, NeoForge, Quilt, Modrinth Theseus, .minecraft, Prism, CurseForge.
- Analyzes: Mods, Loaders, Coremods, Injected Class Jars, and Nested Jars.
+ Features:
+  [1] Live Java Process Memory (RAM) Scanner (active & terminated cheat traces)
+  [2] Automatic Active Instance Detection (auto-detects running 1.21+, 1.8.9, etc.)
+  [3] Classpath & Loader Extraction (Fabric Loader, Forge, Quilt, SpongeMixin)
+  [4] Deep JAR Inspection (Mods, Processed Mods, Nested Jar-in-Jar)
+  [5] DNS Cache Forensic Analysis (detects contacted cheat auth servers)
+  [6] Whitelisted Launcher Agents (Modrinth Theseus, JRebel, etc.)
 ================================================================================
 #>
 
@@ -12,7 +16,7 @@ param (
     [Parameter(Position = 0, ValueFromPipeline = $true)]
     [string]$Target = "",
     [switch]$All,
-    [switch]$IncludeLoader,
+    [switch]$IncludeLoader = $true,
     [switch]$Offline,
     [string]$ExportJson = "",
     [string]$ExportHtml = ""
@@ -34,8 +38,8 @@ Write-Host ""
 Write-Host "  ========================================================================" -ForegroundColor Cyan
 Write-Host "   UNIVERSAL MINECRAFT CHEAT SCANNER (lwkyyy Forensic Engine)            " -ForegroundColor Cyan
 Write-Host "  ========================================================================" -ForegroundColor Cyan
-Write-Host "   [+] Universal Version Engine: 1.7.10 -> 1.8.9 -> 1.12.2 -> 1.21+      " -ForegroundColor DarkCyan
-Write-Host "   [+] Loaders: Fabric, Forge, NeoForge, Quilt, Modrinth, Prism, Vanilla " -ForegroundColor DarkCyan
+Write-Host "   [+] Live RAM Memory Inspection (Active & Terminated Cheat Strings)     " -ForegroundColor DarkCyan
+Write-Host "   [+] Auto-Detect Active Instance & Classpath (Fabric Loader, Forge)     " -ForegroundColor DarkCyan
 Write-Host "   [+] Deep Heuristic Search: 380+ Clients, Fullwidth Unicode, Trojans    " -ForegroundColor DarkCyan
 Write-Host "  ------------------------------------------------------------------------" -ForegroundColor DarkGray
 Write-Host ""
@@ -44,14 +48,100 @@ Write-Host ""
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 
 # ------------------------------------------------------------------------------
-# 2. UNIVERSAL CHEAT & MODULE SIGNATURE DATABASE
+# 2. P/INVOKE LIVE MEMORY SCANNER (ReadProcessMemory + VirtualQueryEx)
+# ------------------------------------------------------------------------------
+$memScannerCode = @"
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Runtime.InteropServices;
+using System.Text;
+
+public class LiveMemoryScanner {
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern IntPtr OpenProcess(int dwDesiredAccess, bool bInheritHandle, int dwProcessId);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool ReadProcessMemory(IntPtr hProcess, IntPtr lpBaseAddress, [Out] byte[] lpBuffer, int dwSize, out IntPtr lpNumberOfBytesRead);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern int VirtualQueryEx(IntPtr hProcess, IntPtr lpAddress, out MEMORY_BASIC_INFORMATION lpBuffer, uint dwLength);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool CloseHandle(IntPtr hObject);
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct MEMORY_BASIC_INFORMATION {
+        public IntPtr BaseAddress;
+        public IntPtr AllocationBase;
+        public uint AllocationProtect;
+        public IntPtr RegionSize;
+        public uint State;
+        public uint Protect;
+        public uint Type;
+    }
+
+    const int PROCESS_QUERY_INFORMATION = 0x0400;
+    const int PROCESS_VM_READ = 0x0010;
+    const uint MEM_COMMIT = 0x1000;
+    const uint PAGE_GUARD = 0x100;
+    const uint PAGE_NOACCESS = 0x01;
+
+    public static List<string> ScanProcessMemory(int pid, string[] signatures, int maxMbToScan = 250) {
+        var foundMatches = new List<string>();
+        IntPtr hProc = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, false, pid);
+        if (hProc == IntPtr.Zero) return foundMatches;
+
+        long address = 0;
+        long totalScannedBytes = 0;
+        long maxBytes = (long)maxMbToScan * 1024 * 1024;
+        int structSize = Marshal.SizeOf(typeof(MEMORY_BASIC_INFORMATION));
+        MEMORY_BASIC_INFORMATION memInfo;
+
+        while (address < 0x7FFFFFFF0000 && totalScannedBytes < maxBytes) {
+            int ret = VirtualQueryEx(hProc, (IntPtr)address, out memInfo, (uint)structSize);
+            if (ret == 0) break;
+
+            long size = (long)memInfo.RegionSize;
+            if (size > 0 && size <= 40 * 1024 * 1024 && memInfo.State == MEM_COMMIT && (memInfo.Protect & PAGE_GUARD) == 0 && (memInfo.Protect & PAGE_NOACCESS) == 0) {
+                byte[] buffer = new byte[size];
+                IntPtr bytesRead;
+                if (ReadProcessMemory(hProc, memInfo.BaseAddress, buffer, (int)size, out bytesRead)) {
+                    int readLen = (int)bytesRead;
+                    totalScannedBytes += readLen;
+                    string ascii = Encoding.ASCII.GetString(buffer, 0, readLen);
+
+                    for (int i = 0; i < signatures.Length; i++) {
+                        string s = signatures[i];
+                        if (ascii.IndexOf(s, StringComparison.OrdinalIgnoreCase) >= 0) {
+                            if (!foundMatches.Contains(s)) {
+                                foundMatches.Add(s);
+                            }
+                        }
+                    }
+                }
+            }
+            address = (long)memInfo.BaseAddress + size;
+        }
+
+        CloseHandle(hProc);
+        return foundMatches;
+    }
+}
+"@
+
+try {
+    Add-Type -TypeDefinition $memScannerCode -Language CSharp -ErrorAction SilentlyContinue
+} catch { }
+
+# ------------------------------------------------------------------------------
+# 3. UNIVERSAL SIGNATURE DATABASE
 # ------------------------------------------------------------------------------
 
-# 380+ Cheat Clients, Anarchy Clients & Ghost Clients (All Eras)
+# 380+ Known Cheat Clients
 $script:KnownCheatClients = @(
-    # Modern & CPvP / Anchor Clients
     "DoomsdayClient", "doomsdayclient", "doomsday.jar", "com/doomsday", "doomsdayclient.com",
-    "NovaClient", "novaclient", "api.novaclient.lol", "novoware", "aHR0cDovL2FwaS5ub3ZhY2xpZW50LmxvbC93ZWJob29rLnR4dA==",
+    "NovaClient", "novaclient", "api.novaclient.lol", "novoware",
     "BozeClient", "bozeclient", "boze.dev", "dqrkis.xyz", "Dqrkis", "dqrkis", "OrchardClient", "orchard",
     "ZenithMacros", "zenithmacros", "VelarisClient", "velaris", "KarmaClient", "karma", "PikaClient", "pika",
     "anamvmnt", "CalciumClient", "calcium", "ZelithClient", "zelith", "XenonClient", "xenon client", "Xenon", "xenon",
@@ -60,8 +150,6 @@ $script:KnownCheatClients = @(
     "PrestigeClient", "prestigeclient", "prestigeclient.vip", "198Macros", "198macros.com", "macro_198", "Macro198",
     "DeltaClient", "ElysianClient", "OnyxClient", "LuminaClient", "MomentumClient", "RavenBPlus", "Raven B++",
     "LWFHCrystal", "LWFH Crystal", "WalksyOptimizer", "WalskyOptimizer", "WalksyCrystalOptimizerMod", "walsky.optimizer",
-
-    # Popular 1.8.9 & 1.12.2 Ghost & Blatant Clients
     "VapeClient", "vapeclient", "VapeLite", "vape.gg", "com/cheatbreaker",
     "MeteorClient", "meteorclient", "meteordevelopment.meteorclient", "meteor-client",
     "LiquidBounce", "liquidbounce", "fdp-client", "net.ccbluex",
@@ -77,15 +165,13 @@ $script:KnownCheatClients = @(
     "ZeroTwoClient", "SalHack", "SalHackSkid", "Skidcraft", "SorusClient", "GameSense", "OsirisClient", "CosmosClient",
     "FutureClient", "Rusherhack", "InertiaClient", "Exhibition", "Novoline", "RiseClient", "riseclient.com",
     "Tenacity", "Augustus", "MoonClient", "Astolfo", "Pandaware",
-
-    # Refmaps & internal packages
     "phantom-refmap.json", "cheat-refmap.json", "client-refmap.json",
     "xyz/greaj", "xyz.greaj", "org/chainlibs/module/impl/modules", "org.chainlibs.module.impl.modules"
 )
 
-# Universal Cheat Modules (1.7/1.8 Old Combat + 1.9/1.21 Modern CPvP)
+# Universal Cheat Modules (Legacy Combat + Modern CPvP)
 $script:CheatModuleStrings = @(
-    # Combat & Aim (Old & New)
+    # Combat & Aim
     "TriggerBot", "triggerbot", "trigger bot",
     "AimAssist", "aimassist", "aim assist", "SilentAim", "silentaim", "silent aim", "BowAim", "BowAimbot", "AimLock", "HeadSnap",
     "KillAura", "killaura", "kill aura", "ClickAura", "MultiAura", "ForceField", "LegitAura",
@@ -119,11 +205,12 @@ $script:CheatModuleStrings = @(
     "XRayHack", "OreFinder", "CaveFinder", "OreESP", "NewChunks", "TunnelFinder", "BaseFinder",
     "Freecam", "NoClip", "FreezePlayer", "TargetHUD", "ReachDisplay", "RtpBaseFinder", "StashFinder",
 
-    # Automation, Stealers & Trojans
+    # Automation & Trojans
     "ChestStealer", "cheststealer", "InvManager", "invmanager", "InvMove", "InventoryMove",
     "AutoEat", "AutoXP", "FastXP", "FastExp", "AutoTool", "AutoMine", "ShulkerDropper", "CordSnapper", "KeyPearl", "AutoTPA",
     "LootYeeter", "AutoWeb", "WebMacro",
-    # Sensitive signatures decoded at runtime to prevent antivirus AMSI heuristic flags
+
+    # Decoded at runtime to avoid AMSI heuristic warnings
     ([System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String("U2Vzc2lvblN0ZWFsZXI="))),
     ([System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String("VG9rZW5Mb2dnZXI="))),
     ([System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String("VG9rZW5HcmFiYmVy"))),
@@ -162,10 +249,8 @@ $escapedModules = ($script:CheatModuleStrings | ForEach-Object { [regex]::Escape
 $script:ModuleRegex = [regex]::new("(?<![A-Za-z0-9_])($escapedModules)(?![A-Za-z0-9_])", [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
 
 # ------------------------------------------------------------------------------
-# 3. HELPER ROUTINES
+# 4. HELPER ROUTINES
 # ------------------------------------------------------------------------------
-
-# Convert Fullwidth Unicode evasion strings to standard ASCII
 function Convert-FullwidthToAscii {
     param([string]$InputText)
     if ([string]::IsNullOrEmpty($InputText)) { return "" }
@@ -187,7 +272,6 @@ function Convert-FullwidthToAscii {
     }
 }
 
-# Fast SHA1 Hash
 function Get-FileSha1 {
     param([string]$FilePath)
     try {
@@ -201,7 +285,6 @@ function Get-FileSha1 {
     }
 }
 
-# Modrinth API query cache
 $script:ModrinthCache = @{}
 function Verify-ModrinthFile {
     param([string]$Sha1)
@@ -223,7 +306,66 @@ function Verify-ModrinthFile {
 }
 
 # ------------------------------------------------------------------------------
-# 4. UNIVERSAL INSTANCE & LAUNCHER AUTO-DISCOVERY
+# 5. RUNNING PROCESS & AUTOMATIC INSTANCE RESOLVER
+# ------------------------------------------------------------------------------
+function Get-RunningMinecraftInfo {
+    $procs = Get-Process -Name javaw, java -ErrorAction SilentlyContinue
+    if (-not $procs) { return $null }
+
+    foreach ($p in $procs) {
+        try {
+            $wmi = Get-WmiObject Win32_Process -Filter "ProcessId = $($p.Id)" -ErrorAction Stop
+            $cmd = $wmi.CommandLine
+            if ($cmd -match "net\.minecraft" -or $cmd -match "knot\.KnotClient" -or $cmd -match "launchwrapper" -or $cmd -match "--gameDir") {
+                # Extract gameDir
+                $gameDir = ""
+                if ($cmd -match '--gameDir\s+"([^"]+)"') {
+                    $gameDir = $matches[1]
+                } elseif ($cmd -match '--gameDir\s+([^\s]+)') {
+                    $gameDir = $matches[1]
+                }
+
+                # Extract game version
+                $version = ""
+                if ($cmd -match '--version\s+([^\s]+)') {
+                    $version = $matches[1]
+                }
+
+                # Extract username
+                $username = ""
+                if ($cmd -match '--username\s+([^\s]+)') {
+                    $username = $matches[1]
+                }
+
+                # Extract classpath JARs (-cp)
+                $cpJars = [System.Collections.Generic.List[string]]::new()
+                if ($cmd -match '-cp\s+"?([^"-]+)"?') {
+                    $rawCp = $matches[1].Trim('"').Trim()
+                    foreach ($entry in ($rawCp -split ";")) {
+                        if ($entry.EndsWith(".jar") -and (Test-Path $entry)) {
+                            [void]$cpJars.Add($entry)
+                        }
+                    }
+                }
+
+                return [PSCustomObject]@{
+                    Pid           = $p.Id
+                    ProcessName   = $p.ProcessName
+                    StartTime     = $p.StartTime
+                    CommandLine   = $cmd
+                    GameDir       = $gameDir
+                    Version       = $version
+                    Username      = $username
+                    ClasspathJars = $cpJars
+                }
+            }
+        } catch { }
+    }
+    return $null
+}
+
+# ------------------------------------------------------------------------------
+# 6. INSTANCE DISCOVERY (Fallback if Minecraft is not running)
 # ------------------------------------------------------------------------------
 function Discover-AllInstances {
     $found = [System.Collections.Generic.List[PSCustomObject]]::new()
@@ -234,7 +376,7 @@ function Discover-AllInstances {
         foreach ($d in (Get-ChildItem -Path $modrinthPath -Directory -ErrorAction SilentlyContinue)) {
             $mPath = Join-Path $d.FullName "mods"
             $count = if (Test-Path $mPath) { (Get-ChildItem -Path $mPath -Filter "*.jar" -File -ErrorAction SilentlyContinue).Count } else { 0 }
-            $found.Add([PSCustomObject]@{
+            [void]$found.Add([PSCustomObject]@{
                 Launcher = "Modrinth (Theseus)"
                 Name     = $d.Name
                 Path     = $d.FullName
@@ -244,12 +386,12 @@ function Discover-AllInstances {
         }
     }
 
-    # 2. Standard .minecraft (Vanilla, Forge, Fabric, NeoForge)
+    # 2. Standard .minecraft
     $dotMc = "$env:APPDATA\.minecraft"
     if (Test-Path $dotMc) {
         $mPath = Join-Path $dotMc "mods"
         $count = if (Test-Path $mPath) { (Get-ChildItem -Path $mPath -Filter "*.jar" -File -ErrorAction SilentlyContinue).Count } else { 0 }
-        $found.Add([PSCustomObject]@{
+        [void]$found.Add([PSCustomObject]@{
             Launcher = "Default .minecraft"
             Name     = ".minecraft (Standard)"
             Path     = $dotMc
@@ -266,7 +408,7 @@ function Discover-AllInstances {
                 $mcSub = Join-Path $d.FullName ".minecraft"
                 $mPath = if (Test-Path (Join-Path $mcSub "mods")) { Join-Path $mcSub "mods" } else { Join-Path $d.FullName "mods" }
                 $count = if (Test-Path $mPath) { (Get-ChildItem -Path $mPath -Filter "*.jar" -File -ErrorAction SilentlyContinue).Count } else { 0 }
-                $found.Add([PSCustomObject]@{
+                [void]$found.Add([PSCustomObject]@{
                     Launcher = [System.IO.Path]::GetFileName($pRoot)
                     Name     = $d.Name
                     Path     = $d.FullName
@@ -277,80 +419,39 @@ function Discover-AllInstances {
         }
     }
 
-    # 4. CurseForge Instances
-    $cursePath = "$env:USERPROFILE\curseforge\minecraft\Instances"
-    if (Test-Path $cursePath) {
-        foreach ($d in (Get-ChildItem -Path $cursePath -Directory -ErrorAction SilentlyContinue)) {
-            $mPath = Join-Path $d.FullName "mods"
-            $count = if (Test-Path $mPath) { (Get-ChildItem -Path $mPath -Filter "*.jar" -File -ErrorAction SilentlyContinue).Count } else { 0 }
-            $found.Add([PSCustomObject]@{
-                Launcher = "CurseForge"
-                Name     = $d.Name
-                Path     = $d.FullName
-                ModsDir  = $mPath
-                ModCount = $count
-            })
-        }
-    }
-
-    # 5. Feather Client
-    $featherPath = "$env:APPDATA\.feather\user-mods"
-    if (Test-Path $featherPath) {
-        $count = (Get-ChildItem -Path $featherPath -Filter "*.jar" -File -ErrorAction SilentlyContinue).Count
-        $found.Add([PSCustomObject]@{
-            Launcher = "Feather Client"
-            Name     = "Feather User Mods"
-            Path     = "$env:APPDATA\.feather"
-            ModsDir  = $featherPath
-            ModCount = $count
-        })
-    }
-
-    # 6. Lunar / Badlion / Local Versions
-    $versionsDir = "$env:APPDATA\.minecraft\versions"
-    if (Test-Path $versionsDir) {
-        $vDirs = Get-ChildItem -Path $versionsDir -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -match "lunar|badlion|optifine|forge|fabric" }
-        foreach ($vd in $vDirs) {
-            $vJar = Join-Path $vd.FullName "$($vd.Name).jar"
-            if (Test-Path $vJar) {
-                $found.Add([PSCustomObject]@{
-                    Launcher = "Version Client"
-                    Name     = $vd.Name
-                    Path     = $vd.FullName
-                    ModsDir  = $vd.FullName
-                    ModCount = 1
-                })
-            }
-        }
-    }
-
     return $found
 }
 
 # ------------------------------------------------------------------------------
-# 5. COLLECT ALL JARS FOR AN INSTANCE (Mods, Loader, Processed, JiJ)
+# 7. COLLECT ALL JARS FOR AN INSTANCE (Mods, Loader, Processed, JiJ)
 # ------------------------------------------------------------------------------
 function Collect-TargetJars {
     param(
         [PSCustomObject]$Instance,
+        [string[]]$ExplicitClasspathJars = @(),
         [bool]$ScanLoader = $true
     )
 
     $items = [System.Collections.Generic.List[PSCustomObject]]::new()
     $tracked = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
 
-    # 1. Check if Target is a single JAR file directly
-    if (Test-Path $Instance.Path -PathType Leaf) {
-        if ($Instance.Path -match "\.jar$") {
-            $f = Get-Item $Instance.Path
-            [void]$items.Add([PSCustomObject]@{
-                Category = "TARGET_JAR"
-                Name     = $f.Name
-                FullName = $f.FullName
-                Length   = $f.Length
-                Origin   = "Direct Input File"
-            })
-            return ,$items
+    # 1. Any Classpath JARs passed from the running JVM (Fabric Loader, SpongeMixin, etc.)
+    if ($ExplicitClasspathJars -and $ExplicitClasspathJars.Count -gt 0) {
+        foreach ($cp in $ExplicitClasspathJars) {
+            if ($tracked.Add($cp)) {
+                $f = Get-Item $cp -ErrorAction SilentlyContinue
+                if ($f) {
+                    $cat = "LIBRARY"
+                    if ($f.Name -match "fabric-loader|forge|quilt-loader") { $cat = "LOADER" }
+                    [void]$items.Add([PSCustomObject]@{
+                        Category = $cat
+                        Name     = $f.Name
+                        FullName = $f.FullName
+                        Length   = $f.Length
+                        Origin   = "Active JVM Classpath"
+                    })
+                }
+            }
         }
     }
 
@@ -387,17 +488,14 @@ function Collect-TargetJars {
         }
     }
 
-    # 4. Core Loader JARs (Fabric Loader, Forge Universal, Quilt Loader)
+    # 4. Core Loader JARs (Fabric Loader, Forge, Quilt Loader from meta/libraries)
     if ($ScanLoader) {
         $loaderPaths = @(
-            # Modrinth Theseus Libraries
             "$env:APPDATA\ModrinthApp\meta\libraries\net\fabricmc\fabric-loader",
             "$env:APPDATA\ModrinthApp\meta\libraries\org\quiltmc\quilt-loader",
-            # Standard .minecraft Libraries
             "$env:APPDATA\.minecraft\libraries\net\fabricmc\fabric-loader",
             "$env:APPDATA\.minecraft\libraries\net\minecraftforge\forge",
-            "$env:APPDATA\.minecraft\libraries\net\neoforged\neoforge",
-            "$env:APPDATA\.minecraft\libraries\org\quiltmc\quilt-loader"
+            "$env:APPDATA\.minecraft\libraries\net\neoforged\neoforge"
         )
         foreach ($lp in $loaderPaths) {
             if (Test-Path $lp) {
@@ -421,7 +519,7 @@ function Collect-TargetJars {
 }
 
 # ------------------------------------------------------------------------------
-# 6. HIGH-PERFORMANCE JAR FORENSIC ENGINE
+# 8. DEEP JAR FORENSIC SCANNER
 # ------------------------------------------------------------------------------
 function Analyze-JarForensics {
     param([PSCustomObject]$JarItem)
@@ -466,7 +564,7 @@ function Analyze-JarForensics {
     $allEntries = [System.Collections.Generic.List[object]]::new()
     $innerZipList = [System.Collections.Generic.List[object]]::new()
 
-    foreach ($e in $zip.Entries) { $allEntries.Add($e) }
+    foreach ($e in $zip.Entries) { [void]$allEntries.Add($e) }
 
     # Detect & Unpack Jar-in-Jar (JiJ / Nested JARs)
     $nested = @($zip.Entries | Where-Object { $_.FullName -match "\.jar$" })
@@ -477,8 +575,8 @@ function Analyze-JarForensics {
             $ms = New-Object System.IO.MemoryStream
             $stream.CopyTo($ms); $stream.Close(); $ms.Position = 0
             $iz = [System.IO.Compression.ZipArchive]::new($ms, [System.IO.Compression.ZipArchiveMode]::Read)
-            $innerZipList.Add($iz)
-            foreach ($ie in $iz.Entries) { $allEntries.Add($ie) }
+            [void]$innerZipList.Add($iz)
+            foreach ($ie in $iz.Entries) { [void]$allEntries.Add($ie) }
         } catch { }
     }
 
@@ -491,7 +589,7 @@ function Analyze-JarForensics {
     foreach ($entry in $allEntries) {
         $entryName = $entry.FullName
 
-        # Detect Loader Metadata: Fabric, Quilt, or Forge
+        # Detect Loader Metadata
         if ($entryName -eq "fabric.mod.json") {
             $result.ModLoaderType = "Fabric"
             try {
@@ -505,7 +603,7 @@ function Analyze-JarForensics {
             $result.ModLoaderType = "Forge/NeoForge"
         }
 
-        # Scan Entry Paths against Client and Module Signatures
+        # Scan Entry Paths against Signatures
         foreach ($m in $script:ClientRegex.Matches($entryName)) { [void]$result.ClientMatches.Add($m.Value) }
         foreach ($m in $script:ModuleRegex.Matches($entryName)) { [void]$result.ModuleMatches.Add($m.Value) }
 
@@ -513,7 +611,6 @@ function Analyze-JarForensics {
         if ($entryName -match "\.(class|json|properties)$" -or $entryName -match "MANIFEST\.MF") {
             if ($entryName -match "\.class$") { $totalClasses++ }
 
-            # Limit reading very large entry streams (> 1MB) for speed
             if ($entry.Length -gt 0 -and $entry.Length -lt 1048576) {
                 try {
                     $est = $entry.Open()
@@ -528,7 +625,7 @@ function Analyze-JarForensics {
                     foreach ($m in $script:ClientRegex.Matches($asciiText)) { [void]$result.ClientMatches.Add($m.Value) }
                     foreach ($m in $script:ClientRegex.Matches($utf8Text))  { [void]$result.ClientMatches.Add($m.Value) }
 
-                    # 2. Generic Cheat Modules (Word-boundary check)
+                    # 2. Generic Cheat Modules
                     foreach ($m in $script:ModuleRegex.Matches($asciiText)) { [void]$result.ModuleMatches.Add($m.Value) }
                     foreach ($m in $script:ModuleRegex.Matches($utf8Text))  { [void]$result.ModuleMatches.Add($m.Value) }
 
@@ -555,14 +652,14 @@ function Analyze-JarForensics {
                     }
                     $webhookPattern = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String("ZGlzY29yZC5jb20vYXBpL3dlYmhvb2tz"))
                     if ($asciiText.Contains($webhookPattern)) {
-                        $result.TrojanAlerts.Add("Embedded Discord Webhook (credential / token grabber risk)")
+                        [void]$result.TrojanAlerts.Add("Embedded Discord Webhook (credential / token grabber risk)")
                     }
 
                     # 5. Obfuscator Signatures
                     foreach ($obf in $script:KnownObfuscators.Keys) {
                         foreach ($sig in $script:KnownObfuscators[$obf]) {
                             if ($asciiText.Contains($sig)) {
-                                $result.ObfuscatorAlerts.Add("$obf Obfuscator ($sig)")
+                                [void]$result.ObfuscatorAlerts.Add("$obf Obfuscator ($sig)")
                                 break
                             }
                         }
@@ -572,22 +669,21 @@ function Analyze-JarForensics {
         }
     }
 
-    # Dispose all zip instances
     foreach ($iz in $innerZipList) { try { $iz.Dispose() } catch { } }
     $zip.Dispose()
 
     $result.TotalClasses = $totalClasses
 
     # Evaluate Trojan Flags
-    if ($hasRuntimeExec)  { $result.TrojanAlerts.Add("Runtime.exec() Execution - runs arbitrary OS commands") }
-    if ($hasHttpDownload) { $result.TrojanAlerts.Add("HTTP Remote File Downloader - writes remote executables to disk") }
-    if ($hasHttpExfil)    { $result.TrojanAlerts.Add("HTTP POST Data Exfiltration - sends machine data to remote endpoint") }
+    if ($hasRuntimeExec)  { [void]$result.TrojanAlerts.Add("Runtime.exec() Execution - runs arbitrary OS commands") }
+    if ($hasHttpDownload) { [void]$result.TrojanAlerts.Add("HTTP Remote File Downloader - writes remote executables to disk") }
+    if ($hasHttpExfil)    { [void]$result.TrojanAlerts.Add("HTTP POST Data Exfiltration - sends machine data to remote endpoint") }
 
-    # Identity Spoofing Protection (claims to be sodium/lithium/optifine but has cheats)
+    # Identity Spoofing Protection
     $safeBrands = @("sodium", "lithium", "iris", "fabric-api", "optifine", "ferritecore", "immediatelyfast", "entityculling")
     if ($result.ModId -and ($safeBrands -contains $result.ModId.ToLower())) {
         if ($result.ClientMatches.Count -gt 0 -or $result.TrojanAlerts.Count -gt 0) {
-            $result.TrojanAlerts.Add("Identity Spoofing: Claims to be '$($result.ModId)' but contains cheat/trojan signatures!")
+            [void]$result.TrojanAlerts.Add("Identity Spoofing: Claims to be '$($result.ModId)' but contains cheat/trojan signatures!")
         }
     }
 
@@ -600,12 +696,17 @@ function Analyze-JarForensics {
 }
 
 # ------------------------------------------------------------------------------
-# 7. JVM PROCESS RUNTIME INJECTION SCANNER
+# 9. JVM PROCESS RUNTIME INJECTION & DNS CACHE SCANNER
 # ------------------------------------------------------------------------------
 function Check-JvmInjections {
     $alerts = [System.Collections.Generic.List[string]]::new()
     $javaProcs = Get-Process -Name javaw, java -ErrorAction SilentlyContinue
     if (-not $javaProcs) { return $alerts }
+
+    # Whitelist official launcher agents:
+    # theseus -> Modrinth App official IPC & rich presence agent
+    # jmxremote, yjp, jrebel, newrelic, jacoco -> standard dev/monitoring tools
+    $agentWhitelist = @("theseus", "jmxremote", "yjp", "jrebel", "newrelic", "jacoco")
 
     foreach ($p in $javaProcs) {
         try {
@@ -617,37 +718,81 @@ function Check-JvmInjections {
                 foreach ($ag in $agents) {
                     $agPath = $ag.Groups[1].Value.Trim('"', "'")
                     $agName = [System.IO.Path]::GetFileName($agPath)
-                    $whitelist = @("jmxremote", "yjp", "jrebel", "newrelic", "jacoco")
                     $isWhitelisted = $false
-                    foreach ($w in $whitelist) { if ($agName -match $w) { $isWhitelisted = $true; break } }
+                    foreach ($w in $agentWhitelist) {
+                        if ($agName.ToLower().Contains($w)) { $isWhitelisted = $true; break }
+                    }
                     if (-not $isWhitelisted) {
-                        $alerts.Add("Active JVM Agent: $agName (PID $($p.Id)) -> $agPath")
+                        [void]$alerts.Add("Suspicious JVM Agent: $agName (PID $($p.Id)) -> $agPath")
                     }
                 }
                 # Look for bootclasspath overrides and debug agents
-                if ($cmd -match "-Xbootclasspath/p:") { $alerts.Add("Suspicious JVM Flag: -Xbootclasspath/p (Overrides Java Core Classes)") }
-                if ($cmd -match "-Xbootclasspath/a:") { $alerts.Add("Suspicious JVM Flag: -Xbootclasspath/a (Appends Classes to System Loader)") }
-                if ($cmd -match "-agentlib:jdwp")     { $alerts.Add("Active JDWP Debug Port (Enables Remote Process Hijacking / Memory Control)") }
-                if ($cmd -match "-agentpath:")        { $alerts.Add("Native Agent Attached via -agentpath (Bypasses JVM Sandbox)") }
+                if ($cmd -match "-Xbootclasspath/p:") { [void]$alerts.Add("Suspicious JVM Flag: -Xbootclasspath/p (Overrides Java Core Classes)") }
+                if ($cmd -match "-Xbootclasspath/a:") { [void]$alerts.Add("Suspicious JVM Flag: -Xbootclasspath/a (Appends Classes to System Loader)") }
+                if ($cmd -match "-agentlib:jdwp")     { [void]$alerts.Add("Active JDWP Debug Port (Enables Remote Process Hijacking / Memory Control)") }
+                if ($cmd -match "-agentpath:")        { [void]$alerts.Add("Native Agent Attached via -agentpath (Bypasses JVM Sandbox)") }
             }
         } catch { }
     }
     return $alerts
 }
 
+# DNS Cache Scanner (Look for cheat auth domains contacted recently)
+function Check-DnsCacheForensics {
+    $foundDns = [System.Collections.Generic.List[string]]::new()
+    $cheatDomains = @(
+        "vape.gg", "api.novaclient.lol", "doomsdayclient.com", "prestigeclient.vip",
+        "dqrkis.xyz", "198macros.com", "boze.dev", "meteorclient.com",
+        "liquidbounce.net", "intent.store", "riseclient.com", "novoline.lol"
+    )
+    try {
+        $dnsEntries = Get-DnsClientCache -ErrorAction SilentlyContinue
+        if ($dnsEntries) {
+            foreach ($entry in $dnsEntries) {
+                foreach ($cd in $cheatDomains) {
+                    if ($entry.Entry.ToLower().Contains($cd)) {
+                        if (-not $foundDns.Contains($entry.Entry)) {
+                            [void]$foundDns.Add($entry.Entry)
+                        }
+                    }
+                }
+            }
+        }
+    } catch { }
+    return $foundDns
+}
+
 # ------------------------------------------------------------------------------
-# 8. MAIN CLI WORKFLOW & DISPATCHER
+# 10. MAIN CONTROLLER & EXECUTION WORKFLOW
 # ------------------------------------------------------------------------------
 
-# Step A: Resolve Target Instances
+# Step A: Check if Minecraft is actively running!
+$runningMc = Get-RunningMinecraftInfo
 $targetList = [System.Collections.Generic.List[PSCustomObject]]::new()
-$discovered = Discover-AllInstances
+$runningClasspath = @()
 
-if ($Target) {
-    # Custom path passed via CLI parameter or Drag-and-Drop
+if ($runningMc) {
+    Write-Host " [✓] DETECTED ACTIVE MINECRAFT PROCESS!" -ForegroundColor Green
+    Write-Host "     Process PID  : $($runningMc.Pid) ($($runningMc.ProcessName))" -ForegroundColor White
+    Write-Host "     Minecraft Ver: $($runningMc.Version)" -ForegroundColor Yellow
+    Write-Host "     Active Player: $($runningMc.Username)" -ForegroundColor Cyan
+    Write-Host "     Game Directory: $($runningMc.GameDir)" -ForegroundColor DarkGray
+    Write-Host ""
+
+    # Automatically set target without prompting!
+    $runningClasspath = $runningMc.ClasspathJars
+    $mDir = Join-Path $runningMc.GameDir "mods"
+    [void]$targetList.Add([PSCustomObject]@{
+        Launcher = "Active Running Minecraft Instance"
+        Name     = [System.IO.Path]::GetFileName($runningMc.GameDir)
+        Path     = $runningMc.GameDir
+        ModsDir  = if (Test-Path $mDir) { $mDir } else { $runningMc.GameDir }
+        ModCount = if (Test-Path $mDir) { (Get-ChildItem -Path $mDir -Filter "*.jar" -File -ErrorAction SilentlyContinue).Count } else { 0 }
+    })
+} elseif ($Target) {
     if (Test-Path $Target) {
         $isDir = (Get-Item $Target) -is [System.IO.DirectoryInfo]
-        $targetList.Add([PSCustomObject]@{
+        [void]$targetList.Add([PSCustomObject]@{
             Launcher = "Custom Target"
             Name     = [System.IO.Path]::GetFileName($Target)
             Path     = $Target
@@ -658,12 +803,10 @@ if ($Target) {
         Write-Host " [!] Error: Target path not found: $Target" -ForegroundColor Red
         exit 1
     }
-} elseif ($All) {
-    # Scan everything detected
-    $targetList = $discovered
 } else {
-    # Interactive Selection Menu
-    Write-Host " SELECT TARGET TO SCAN:" -ForegroundColor Cyan
+    # If Minecraft is NOT running, discover available instances on disk
+    $discovered = Discover-AllInstances
+    Write-Host " [i] Minecraft is not currently running. Select an instance to scan:" -ForegroundColor Cyan
     Write-Host " ========================================================================" -ForegroundColor DarkGray
     for ($i = 0; $i -lt $discovered.Count; $i++) {
         $inst = $discovered[$i]
@@ -686,7 +829,7 @@ if ($Target) {
         $cInput = $cInput.Trim('"').Trim("'")
         if (Test-Path $cInput) {
             $isDir = (Get-Item $cInput) -is [System.IO.DirectoryInfo]
-            $targetList.Add([PSCustomObject]@{
+            [void]$targetList.Add([PSCustomObject]@{
                 Launcher = "Custom Target"
                 Name     = [System.IO.Path]::GetFileName($cInput)
                 Path     = $cInput
@@ -700,31 +843,71 @@ if ($Target) {
     } else {
         $num = 1
         if ([int]::TryParse($sel, [ref]$num) -and $num -ge 1 -and $num -le $discovered.Count) {
-            $targetList.Add($discovered[$num - 1])
+            [void]$targetList.Add($discovered[$num - 1])
         } elseif ($discovered.Count -gt 0) {
-            $targetList.Add($discovered[0])
-        } else {
-            Write-Host " [!] No Minecraft instances found on this machine." -ForegroundColor Red
-            exit 1
+            [void]$targetList.Add($discovered[0])
         }
     }
 }
 
-# Step B: Check JVM Process Memory / Agents
-Write-Host ""
-Write-Host " [*] Checking running Minecraft JVM processes for stealth injections..." -ForegroundColor DarkCyan
+# Step B: Live Java RAM Memory String Scan (Running & Terminated Cheats)
+$ramHits = @()
+if ($runningMc) {
+    Write-Host " [*] Scanning Live Java Process RAM Memory (PID $($runningMc.Pid))..." -ForegroundColor DarkCyan
+    Write-Host "     Inspecting committed heap for active or terminated cheat client traces..." -ForegroundColor DarkGray
+    
+    # Pool of search signatures for RAM
+    $ramSignatures = @(
+        "DoomsdayClient", "Doomsday", "NovaClient", "novaclient", "VapeClient", "vape.gg", "VapeLite",
+        "MeteorClient", "LiquidBounce", "Sigma5", "WurstClient", "Aristois", "ImpactClient", "AzuraClient",
+        "ArgonClient", "KryptonClient", "PrestigeClient", "198Macros", "DeltaClient", "ElysianClient",
+        "OnyxClient", "LuminaClient", "RavenBPlus", "BozeClient", "Dqrkis", "OrchardClient", "ZenithMacros",
+        "AutoCrystal", "CwCrystal", "dontPlaceCrystal", "canPlaceCrystalServer", "AutoHitCrystal", "AutoDoubleHand",
+        "DoubleAnchor", "SafeAnchor", "AirAnchor", "AnchorMacro", "MarlowAnchor",
+        "AutoTotem", "InventoryTotem", "HoverTotem", "ForceTotem", "Strict One-Tick",
+        "TriggerBot", "AimAssist", "SilentAim", "BowAimbot", "KillAura", "DoubleClicker", "GrimVelocity",
+        "ShieldBreaker", "ShieldDisabler", "AutoMace", "MaceSwap", "SpearSwap", "StunSlam"
+    )
+
+    try {
+        $ramHits = [LiveMemoryScanner]::ScanProcessMemory($runningMc.Pid, $ramSignatures, 300)
+    } catch { }
+
+    if ($ramHits.Count -gt 0) {
+        Write-Host " [!] ALERT: CHEAT STRINGS DETECTED IN ACTIVE RAM MEMORY:" -ForegroundColor Red
+        foreach ($rh in $ramHits) {
+            Write-Host "     >>> RAM String Hit: $rh" -ForegroundColor Red
+        }
+    } else {
+        Write-Host " [✓] Process RAM memory scan complete: Clean of known cheat signatures." -ForegroundColor Green
+    }
+    Write-Host ""
+}
+
+# Step C: Check JVM Process Command Line & Agents
+Write-Host " [*] Inspecting JVM Runtime Agents & Debugger Hooks..." -ForegroundColor DarkCyan
 $jvmInjections = Check-JvmInjections
 if ($jvmInjections.Count -gt 0) {
-    Write-Host " [ALERT] RUNTIME JVM INJECTIONS / AGENTS DETECTED:" -ForegroundColor Red
+    Write-Host " [ALERT] SUSPICIOUS RUNTIME INJECTIONS / AGENTS FOUND:" -ForegroundColor Red
     foreach ($ai in $jvmInjections) {
         Write-Host "   >>> $ai" -ForegroundColor Red
     }
 } else {
-    Write-Host " [OK] No injected JVM agents or debugger hooks found in active Java processes." -ForegroundColor Green
+    Write-Host " [OK] All JVM agents verified clean (Modrinth Theseus whitelisted)." -ForegroundColor Green
 }
 Write-Host ""
 
-# Step C: Execute Forensics Across Target Jars
+# Step D: Check DNS Cache for Cheat Auth Servers
+$dnsAlerts = Check-DnsCacheForensics
+if ($dnsAlerts.Count -gt 0) {
+    Write-Host " [ALERT] FORENSIC DNS CACHE HITS (Cheat Server Connections Detected):" -ForegroundColor Red
+    foreach ($da in $dnsAlerts) {
+        Write-Host "   >>> DNS Domain Resolved: $da" -ForegroundColor Red
+    }
+    Write-Host ""
+}
+
+# Step E: Execute Forensics Across Target Jars (Mods, Loader, Classpath)
 $allResults = [System.Collections.Generic.List[PSCustomObject]]::new()
 $scannedCount = 0
 
@@ -734,9 +917,9 @@ foreach ($t in $targetList) {
     Write-Host " Path: $($t.Path)" -ForegroundColor DarkGray
     Write-Host "========================================================================" -ForegroundColor DarkCyan
 
-    $rawJars = Collect-TargetJars -Instance $t -ScanLoader $IncludeLoader
+    $rawJars = Collect-TargetJars -Instance $t -ExplicitClasspathJars $runningClasspath -ScanLoader $IncludeLoader
     $jarFiles = @($rawJars)
-    Write-Host " Found $($jarFiles.Count) JAR(s) to analyze." -ForegroundColor Green
+    Write-Host " Found $($jarFiles.Count) JAR(s) to analyze (including Mods, Fabric Loader & Classpath)." -ForegroundColor Green
     Write-Host ""
 
     $curIdx = 0
@@ -747,7 +930,7 @@ foreach ($t in $targetList) {
         Write-Progress -Activity "Forensic Analysis: $($t.Name)" -Status "Scanning $curIdx/$($totalCount): $($jf.Name)" -PercentComplete $pct
 
         $analysis = Analyze-JarForensics -JarItem $jf
-        $allResults.Add($analysis)
+        [void]$allResults.Add($analysis)
         $scannedCount++
 
         # Terminal Visual Cards
@@ -793,7 +976,7 @@ foreach ($t in $targetList) {
 }
 
 # ------------------------------------------------------------------------------
-# 9. FINAL FORENSIC SUMMARY REPORT
+# 11. FINAL FORENSIC SUMMARY REPORT
 # ------------------------------------------------------------------------------
 $flaggedItems = @($allResults | Where-Object { $_.IsSuspicious })
 $verifiedItems = @($allResults | Where-Object { $_.ModrinthVerified })
@@ -806,12 +989,20 @@ Write-Host " Total JAR Files Scanned   : $scannedCount" -ForegroundColor White
 Write-Host " Officially Verified Mods  : $($verifiedItems.Count)" -ForegroundColor Green
 Write-Host " Clean / Unflagged JARs    : $cleanItemsCount" -ForegroundColor Gray
 Write-Host " Flagged Suspicious Files  : $($flaggedItems.Count)" -ForegroundColor $(if ($flaggedItems.Count -gt 0) { "Red" } else { "Green" })
+Write-Host " RAM Memory Cheat Traces   : $($ramHits.Count)" -ForegroundColor $(if ($ramHits.Count -gt 0) { "Red" } else { "Green" })
 Write-Host " Active JVM Injections     : $($jvmInjections.Count)" -ForegroundColor $(if ($jvmInjections.Count -gt 0) { "Red" } else { "Green" })
+Write-Host " DNS Cache Cheat Domains   : $($dnsAlerts.Count)" -ForegroundColor $(if ($dnsAlerts.Count -gt 0) { "Red" } else { "Green" })
 Write-Host "------------------------------------------------------------------------" -ForegroundColor DarkCyan
 
-if ($flaggedItems.Count -gt 0) {
+if ($flaggedItems.Count -gt 0 -or $ramHits.Count -gt 0 -or $dnsAlerts.Count -gt 0) {
     Write-Host ""
     Write-Host " [!] SUMMARY OF FLAGGED DETECTIONS:" -ForegroundColor Red
+    if ($ramHits.Count -gt 0) {
+        Write-Host " -> LIVE RAM MEMORY DETECTIONS: $($ramHits -join ', ')" -ForegroundColor Red
+    }
+    if ($dnsAlerts.Count -gt 0) {
+        Write-Host " -> DNS CACHE CHEAT DOMAINS   : $($dnsAlerts -join ', ')" -ForegroundColor Red
+    }
     foreach ($fl in $flaggedItems) {
         Write-Host " -> $($fl.Name) ($($fl.Category))" -ForegroundColor Yellow
         if ($fl.ClientMatches.Count -gt 0) { Write-Host "    Clients: $($fl.ClientMatches -join ', ')" -ForegroundColor Red }
@@ -819,10 +1010,10 @@ if ($flaggedItems.Count -gt 0) {
         if ($fl.TrojanAlerts.Count -gt 0)  { Write-Host "    Trojans: $($fl.TrojanAlerts -join ' | ')" -ForegroundColor Red }
     }
 } else {
-    Write-Host " [OK] No cheat clients, combat macros, or trojans detected in scanned files." -ForegroundColor Green
+    Write-Host " [OK] ALL CHECKS CLEAN: No cheat clients, RAM traces, or trojans detected." -ForegroundColor Green
 }
 
-# Step D: Exporting Reports if requested
+# Exporting JSON if requested
 if ($ExportJson) {
     try {
         $jsonContent = $allResults | ConvertTo-Json -Depth 6
