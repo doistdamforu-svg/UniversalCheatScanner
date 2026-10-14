@@ -57,7 +57,7 @@ using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Text;
 
-public class FastLiveMemoryScanner {
+public class FastMemoryScanner {
     [DllImport("kernel32.dll", SetLastError = true)]
     public static extern IntPtr OpenProcess(int dwDesiredAccess, bool bInheritHandle, int dwProcessId);
 
@@ -89,7 +89,7 @@ public class FastLiveMemoryScanner {
 
     const int CHUNK_SIZE = 1024 * 1024; // 1MB buffer
 
-    public static List<string> ScanProcessMemory(int pid, string[] signatures, int maxMbToScan = 80) {
+    public static List<string> Scan(int pid, string[] signatures, int maxMbToScan = 80) {
         var foundMatches = new List<string>();
         IntPtr hProc = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, false, pid);
         if (hProc == IntPtr.Zero) return foundMatches;
@@ -784,12 +784,26 @@ function Check-DnsCacheForensics {
 # 10. MAIN CONTROLLER & EXECUTION WORKFLOW
 # ------------------------------------------------------------------------------
 
-# Step A: Check if Minecraft is actively running!
+# Step A: Check Target or Active Running Instance!
 $runningMc = Get-RunningMinecraftInfo
 $targetList = [System.Collections.Generic.List[PSCustomObject]]::new()
-$runningClasspath = @()
+$runningClasspath = if ($runningMc) { $runningMc.ClasspathJars } else { @() }
 
-if ($runningMc) {
+if ($Target) {
+    if (Test-Path $Target) {
+        $isDir = (Get-Item $Target) -is [System.IO.DirectoryInfo]
+        [void]$targetList.Add([PSCustomObject]@{
+            Launcher = "Custom Target"
+            Name     = [System.IO.Path]::GetFileName($Target)
+            Path     = $Target
+            ModsDir  = if ($isDir -and (Test-Path (Join-Path $Target "mods"))) { Join-Path $Target "mods" } else { $Target }
+            ModCount = if ($isDir) { (Get-ChildItem -Path $Target -Filter "*.jar" -File -Recurse -ErrorAction SilentlyContinue).Count } else { 1 }
+        })
+    } else {
+        Write-Host " [!] Error: Target path not found: $Target" -ForegroundColor Red
+        exit 1
+    }
+} elseif ($runningMc) {
     Write-Host " [OK] DETECTED ACTIVE MINECRAFT PROCESS!" -ForegroundColor Green
     Write-Host "     Process PID  : $($runningMc.Pid) ($($runningMc.ProcessName))" -ForegroundColor White
     Write-Host "     Minecraft Ver: $($runningMc.Version)" -ForegroundColor Yellow
@@ -807,20 +821,7 @@ if ($runningMc) {
         ModsDir  = if (Test-Path $mDir) { $mDir } else { $runningMc.GameDir }
         ModCount = if (Test-Path $mDir) { (Get-ChildItem -Path $mDir -Filter "*.jar" -File -ErrorAction SilentlyContinue).Count } else { 0 }
     })
-} elseif ($Target) {
-    if (Test-Path $Target) {
-        $isDir = (Get-Item $Target) -is [System.IO.DirectoryInfo]
-        [void]$targetList.Add([PSCustomObject]@{
-            Launcher = "Custom Target"
-            Name     = [System.IO.Path]::GetFileName($Target)
-            Path     = $Target
-            ModsDir  = if ($isDir -and (Test-Path (Join-Path $Target "mods"))) { Join-Path $Target "mods" } else { $Target }
-            ModCount = if ($isDir) { (Get-ChildItem -Path $Target -Filter "*.jar" -File -Recurse -ErrorAction SilentlyContinue).Count } else { 1 }
-        })
-    } else {
-        Write-Host " [!] Error: Target path not found: $Target" -ForegroundColor Red
-        exit 1
-    }
+
 } else {
     # If Minecraft is NOT running, discover available instances on disk
     $discovered = Discover-AllInstances
@@ -888,7 +889,7 @@ if ($runningMc) {
     )
 
     try {
-        $ramHits = [FastLiveMemoryScanner]::ScanProcessMemory($runningMc.Pid, $ramSignatures, 80)
+        $ramHits = [FastMemoryScanner]::Scan($runningMc.Pid, $ramSignatures, 80)
     } catch { }
 
     if ($ramHits.Count -gt 0) {
