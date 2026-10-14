@@ -149,11 +149,11 @@ try {
 $script:KnownCheatClients = @(
     "DoomsdayClient", "doomsdayclient", "doomsday.jar", "com/doomsday", "doomsdayclient.com",
     "NovaClient", "novaclient", "api.novaclient.lol", "novoware",
-    "BozeClient", "bozeclient", "boze.dev", "dqrkis.xyz", "Dqrkis", "dqrkis", "OrchardClient", "orchard",
-    "ZenithMacros", "zenithmacros", "VelarisClient", "velaris", "KarmaClient", "karma", "PikaClient", "pika",
-    "anamvmnt", "CalciumClient", "calcium", "ZelithClient", "zelith", "XenonClient", "xenon client", "Xenon", "xenon",
-    "EchoClient", "Echo", "echo client", "CatleanClient", "catlean", "GypsyClient", "gypsy", "lvstrng",
-    "HellionClient", "hellion", "VirginClient", "virgin client", "GrimClient", "grim client", "AsteriaClient", "Asteria",
+    "BozeClient", "bozeclient", "boze.dev", "dqrkis.xyz", "Dqrkis", "dqrkis", "OrchardClient", "orchardclient",
+    "ZenithMacros", "zenithmacros", "VelarisClient", "velaris", "KarmaClient", "karmaclient", "PikaClient", "pikaclient",
+    "anamvmnt", "CalciumClient", "calciumclient", "ZelithClient", "zelith", "XenonClient", "xenon client", "xenonclient",
+    "EchoClient", "echoclient", "echo client", "CatleanClient", "catlean", "GypsyClient", "gypsy", "lvstrng",
+    "HellionClient", "hellion", "VirginClient", "virgin client", "GrimClient", "grim client", "AsteriaClient", "asteriaclient",
     "PrestigeClient", "prestigeclient", "prestigeclient.vip", "198Macros", "198macros.com", "macro_198", "Macro198",
     "DeltaClient", "ElysianClient", "OnyxClient", "LuminaClient", "MomentumClient", "RavenBPlus", "Raven B++",
     "LWFHCrystal", "LWFH Crystal", "WalksyOptimizer", "WalskyOptimizer", "WalksyCrystalOptimizerMod", "walsky.optimizer",
@@ -250,7 +250,7 @@ $script:KnownObfuscators = @{
 
 # Compile Fast Regex Search Engines
 $escapedClients = ($script:KnownCheatClients | ForEach-Object { [regex]::Escape($_) }) -join '|'
-$script:ClientRegex = [regex]::new("($escapedClients)", [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+$script:ClientRegex = [regex]::new("(?<![A-Za-z0-9_])($escapedClients)(?![A-Za-z0-9_])", [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
 
 $escapedModules = ($script:CheatModuleStrings | ForEach-Object { [regex]::Escape($_) }) -join '|'
 $script:ModuleRegex = [regex]::new("(?<![A-Za-z0-9_])($escapedModules)(?![A-Za-z0-9_])", [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
@@ -683,10 +683,12 @@ function Analyze-JarForensics {
 
     $result.TotalClasses = $totalClasses
 
-    # Evaluate Trojan Flags
-    if ($hasRuntimeExec)  { [void]$result.TrojanAlerts.Add("Runtime.exec() Execution - runs arbitrary OS commands") }
-    if ($hasHttpDownload) { [void]$result.TrojanAlerts.Add("HTTP Remote File Downloader - writes remote executables to disk") }
-    if ($hasHttpExfil)    { [void]$result.TrojanAlerts.Add("HTTP POST Data Exfiltration - sends machine data to remote endpoint") }
+    # Evaluate Trojan Flags (Mod loaders & base libraries legitimately handle process launching / networking)
+    if ($JarItem.Category -notin @("LOADER", "LIBRARY")) {
+        if ($hasRuntimeExec)  { [void]$result.TrojanAlerts.Add("Runtime.exec() Execution - runs arbitrary OS commands") }
+        if ($hasHttpDownload) { [void]$result.TrojanAlerts.Add("HTTP Remote File Downloader - writes remote executables to disk") }
+        if ($hasHttpExfil)    { [void]$result.TrojanAlerts.Add("HTTP POST Data Exfiltration - sends machine data to remote endpoint") }
+    }
 
     # Identity Spoofing Protection
     $safeBrands = @("sodium", "lithium", "iris", "fabric-api", "optifine", "ferritecore", "immediatelyfast", "entityculling")
